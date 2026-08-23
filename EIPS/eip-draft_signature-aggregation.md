@@ -1,7 +1,7 @@
 ---
 eip: TBD
-title: Signature Aggregation for EIP-8130 Authenticators
-description: Inline and STARK-aggregated representations for post-quantum canonical authenticators, with dependencies surfaced by the Transaction Context precompile
+title: Signature Aggregation for Authenticators
+description: Inline and STARK-aggregated post-quantum authenticators, with dependencies surfaced by the Transaction Context precompile
 author: Chris Hunter (@chunter-cb) <chris.hunter@coinbase.com>
 discussions-to: TBD
 status: Draft
@@ -11,14 +11,14 @@ created: 2026-08-21
 requires: 8130
 ---
 
+## Abstract
+
 > This proposal continues the work of [EIP-8288](https://github.com/ethereum/EIPs/pull/11772)
 > (post-quantum signature aggregation — Vitalik Buterin, Thomas Coratger) and
 > [EIP-8355](https://github.com/ethereum/EIPs/pull/12048) (FIPS 204 ML-DSA verification precompiles —
 > Danno Ferrin), moving their designs into the EIP-8130 context: the aggregation machinery and the
 > verification semantics are theirs; the contribution here is hanging both off the authenticator
 > abstraction so inline and aggregated are two representations of one actor.
-
-## Abstract
 
 Post-quantum canonical authenticators on [EIP-8130](./eip-8130.md) support two representations of the
 same actor: **inline**, where the signature is carried in the auth blob and verified natively at fixed
@@ -147,8 +147,19 @@ the protocol parse it — no new transaction field). Entry kinds:
   wrapper (aggregated) or inline in the entry (fallback, per-entry representation byte).
 
 Dependencies are charged `DEP_INTRINSIC_GAS` each as intrinsic gas (paid on revert; DoS-priced).
-`hash` values SHOULD be EIP-8130 `replaySafeHash` outputs so account and chain binding are inherent;
-authorization for a dependency's signer is checked at *use*, not at declaration — anyone may declare.
+Because `AGG_WRAP` is a canonical authenticator, the protocol parses the dependency list natively from
+`sender_auth` (same as it parses `K1_AUTHENTICATOR` at `address(1)` — no EVM). Let `n` be the number of
+entries (`n` MUST NOT exceed `MAX_DEPS_PER_TX`). Then:
+
+```
+sender_auth_cost += n * DEP_INTRINSIC_GAS
+```
+
+This term is part of sender-intrinsic gas and therefore inside `gas_limit` (per EIP-8130: the payer pays
+the ETH; both parties sign `gas_limit`). `deps_commitment` is in the signed message, so `n` is not
+malleable. `hash` values SHOULD be domain-separated as in EIP-8130's sender signature payload so account
+and chain binding are inherent; authorization for a dependency's signer is checked at *use*, not at
+declaration — anyone may declare.
 
 **Execution surface.** The Transaction Context precompile gains:
 
