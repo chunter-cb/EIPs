@@ -199,9 +199,9 @@ In both modes a replacement MUST increase both `max_fee_per_gas` and `max_priori
 
 | Type | Name | Defined by |
 |------|------|------------|
-| `0x00`, `0x01` | Reserved | Future entry types |
-| `0x02` | Delegation | This specification |
-| `0x03`+ | Reserved | Future entry types |
+| `0x00` | Reserved | Future entry types |
+| `0x01` | Delegation | This specification |
+| `0x02`+ | Reserved | Future entry types |
 
 A transaction containing an entry type not accepted on the chain is invalid. At most one delegation entry is allowed.
 
@@ -211,7 +211,7 @@ A delegation entry sets [EIP-7702](./eip-7702.md)-style code delegation for the 
 
 ```
 rlp([
-  0x02,               // type: delegation
+  0x01,               // type: delegation
   target              // address: delegate to this contract, or address(0) to clear
 ])
 ```
