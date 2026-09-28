@@ -3,7 +3,7 @@ eip: TBD
 title: AA Transaction Type
 description: A transaction type with batched calls, gas sponsorship, 2D nonces, and in-band code delegation
 author: Chris Hunter (@chunter-cb) <chris.hunter@coinbase.com>
-discussions-to: https://ethereum-magicians.org/t/TBD
+discussions-to: https://ethereum-magicians.org/t/eip-8130-account-abstraction-by-account-configurations/25952
 status: Draft
 type: Standards Track
 category: Core
