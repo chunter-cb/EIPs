@@ -79,7 +79,7 @@ call = rlp([to, value, data])   // to: address, value: uint256, data: bytes
 | `chain_id` | Chain ID per [EIP-155](./eip-155.md) |
 | `sender` | **Empty**: the sender is recovered from `sender_auth`. **20-byte address**: the named sender, authenticated by `sender_auth` (see [Authentication](#authentication)) |
 | `nonce_key` | `uint256` nonce channel selector. `0` for standard sequential ordering, `1` through `NONCE_KEY_MAX - 1` for parallel channels, `NONCE_KEY_MAX` for nonce-free mode |
-| `nonce_sequence` | `uint64` expected sequence number within `nonce_key`. Must match the current sequence for `(sender, nonce_key)`. Incremented after inclusion regardless of execution outcome. Must be `0` when `nonce_key == NONCE_KEY_MAX` |
+| `nonce_sequence` | `uint64` expected sequence number within `nonce_key`. Must match the current sequence for `(sender, nonce_key)`, which for `nonce_key == 0` is the account nonce (see [Nonces](#nonces)). Incremented after inclusion regardless of execution outcome. Must be `0` when `nonce_key == NONCE_KEY_MAX` |
 | `valid_after` | `uint64` Unix timestamp, milliseconds or seconds (see [Timestamp Normalization](#timestamp-normalization)). After normalization, the transaction is invalid when `block.timestamp * 1000 < valid_after`. `0` means no lower bound. Many mempools will not hold a not-yet-active transaction and MAY reject one whose `valid_after` is in the future |
 | `valid_before` | `uint64` Unix timestamp, milliseconds or seconds. After normalization, the transaction is invalid when `block.timestamp * 1000 > valid_before`. `0` means no expiry. Must be non-zero when `nonce_key == NONCE_KEY_MAX` |
 | `max_priority_fee_per_gas` | Maximum priority fee per gas unit ([EIP-1559](./eip-1559.md)) |
@@ -160,11 +160,11 @@ The explicit self-pay form is redundant without Keystore integration. It is kept
 
 ### Nonces
 
-Nonce state is managed by a precompile at `NONCE_MANAGER_ADDRESS`. The protocol reads and increments nonce slots directly during transaction processing; the precompile exposes a read-only `getNonce()` interface to the EVM. Nonce Manager state is separate from the account nonce used by other transaction types.
+`nonce_key` `0` uses the sender's account nonce, the same nonce used by other transaction types: `nonce_sequence` MUST equal it, and inclusion increments it. Keys `1` through `NONCE_KEY_MAX - 1` are held by a precompile at `NONCE_MANAGER_ADDRESS`, separate from the account nonce. The protocol reads and increments them directly during transaction processing; the precompile exposes a read-only `getNonce()` interface to the EVM.
 
 | `nonce_key` Range | Name | Description |
 |-------------------|------|-------------|
-| `0` | Standard | Sequential ordering, mempool default |
+| `0` | Standard | The account nonce, shared with other transaction types. Sequential ordering, mempool default |
 | `1` through `NONCE_KEY_MAX - 1` | User-defined | Parallel transaction channels defined by wallets |
 | `NONCE_KEY_MAX` | Nonce-free | No nonce state read or incremented |
 
@@ -188,7 +188,7 @@ The full transaction hash MUST NOT be used for nonce-free deduplication or repla
 
 ##### Mempool Replacement
 
-- **Standard and 2D transactions** (`nonce_key != NONCE_KEY_MAX`): two pending transactions sharing `(sender, nonce_key, nonce_sequence)` are replacement candidates.
+- **Standard and 2D transactions** (`nonce_key != NONCE_KEY_MAX`): two pending transactions sharing `(sender, nonce_key, nonce_sequence)` are replacement candidates. For `nonce_key == 0` the sequence is the account nonce, so a pending transaction of another type from the same sender with the same nonce is also a replacement candidate.
 - **Nonce-free transactions**: two pending transactions from the same `sender` with the same `replay_id` are replacement candidates, and block builders MUST NOT include two transactions with the same `(sender, replay_id)` in one block.
 
 In both modes a replacement MUST increase both `max_fee_per_gas` and `max_priority_fee_per_gas` by at least the node's configured minimum bump and MUST be independently valid, including a fresh `payer_auth` when sponsored, since `payer_auth` commits to the fee fields and `gas_limit`.
@@ -243,7 +243,7 @@ The protocol dispatches calls directly from `sender`:
 | `msg.value` | `call.value` |
 | `data` | `call.data` |
 
-`call.value` is transferred from `sender` to `call.to` as part of the call frame and is reverted with it. If `sender` cannot cover `call.value` when the call runs, the call fails as a `CALL` with insufficient balance would, and its phase reverts. Transaction validity does not depend on the sender's balance covering call values. If `call.value > 0` and `call.to` does not exist, the account-creation charge applies after the balance check and before the callee's code runs. It is charged at runtime because whether `call.to` exists is only known when the call executes. A non-zero transfer to an address other than `sender` emits the transfer log of [EIP-7708](./eip-7708.md) where that EIP is active.
+`call.value` is transferred from `sender` to `call.to` as part of the call frame and is reverted with it. If `sender` cannot cover `call.value` when the call runs, the call fails as a `CALL` with insufficient balance would, and its phase reverts. Block validity does not depend on the sender's balance covering call values; mempools check it at entry (see [Mempool Acceptance](#mempool-acceptance)). If `call.value > 0` and `call.to` does not exist, the account-creation charge applies after the balance check and before the callee's code runs. It is charged at runtime because whether `call.to` exists is only known when the call executes. A non-zero transfer to an address other than `sender` emits the transfer log of [EIP-7708](./eip-7708.md) where that EIP is active.
 
 #### Call Phases
 
@@ -266,32 +266,35 @@ execution_gas_available = gas_limit - sender_intrinsic_gas
 effective_gas_limit = gas_limit + payer_gas_reserve
 ```
 
-Sender-intrinsic gas is bounded by `gas_limit`. `payer_auth_cost` is metered separately and charged to the payer on top of `gas_limit`: `payer_auth` is excluded from both signature hashes and chosen by the payer, so if it drew from `gas_limit` a payer could starve `calls`. A transaction whose `payer_auth_cost` exceeds `MAX_AUTHENTICATION_GAS` is rejected.
+Sender-intrinsic gas is bounded by `gas_limit`. `payer_auth_cost` is metered separately and charged to the payer on top of `gas_limit`: `payer_auth` is excluded from both signature hashes and chosen by the payer, so if it drew from `gas_limit` a payer could starve `calls`.
 
-`payer_gas_reserve` is `0` for self-pay (`payer` empty) and otherwise `payer_auth_cost`, which is fixed by the authenticator and the serialized `payer_auth` bytes. Either way the gas charged never exceeds `effective_gas_limit`.
+`payer_gas_reserve` is `payer_floor` from the calldata floor below: `0` for self-pay (`payer` empty), otherwise fixed by the authenticator and the serialized `payer_auth` bytes. A transaction whose `payer_gas_reserve` exceeds `MAX_AUTHENTICATION_GAS` is rejected. The gas charged never exceeds `effective_gas_limit`.
 
 | Component | Value |
 |-----------|-------|
 | `AA_BASE_COST` | 15,000: transaction decoding, sender resolution, nonce-mode dispatch, payer settlement, receipt assembly |
 | `tx_payload_cost` | 16 gas per non-zero byte and 4 per zero byte ([EIP-2028](./eip-2028.md)) over the RLP-serialized transaction excluding `payer_auth`, subject to the calldata floor below |
-| `nonce_key_cost` | `NONCE_KEY_MAX`: 13,000 (ring-buffer replay state). Otherwise 22,100 for first use of a `nonce_key`, 5,000 for an existing key |
+| `nonce_key_cost` | `0`: 0 (account nonce, covered by `AA_BASE_COST`). `NONCE_KEY_MAX`: 13,000 (ring-buffer replay state). Otherwise 22,100 for first use of a `nonce_key`, 5,000 for an existing key |
 | `value_transfer_cost` | `TX_VALUE_COST` for each call with `value > 0` and `to != sender` |
 | `account_changes_cost` | `DELEGATION_COST` for a delegation entry, else 0 |
 | `sender_auth_cost` | `K1_AUTH_COST` |
-| `payer_auth_cost` | 0 for self-pay (`payer` empty). Otherwise `K1_AUTH_COST` plus the data cost of the serialized `payer_auth` bytes, floored as below |
+| `payer_auth_cost` | 0 for self-pay (`payer` empty). Otherwise `K1_AUTH_COST + payer_data_cost`, where `payer_data_cost` is 16 gas per non-zero byte and 4 per zero byte over the serialized `payer_auth`, subject to the calldata floor below |
 
 `K1_AUTH_COST` includes one cold account-state read that validation without Keystore integration does not perform. It is charged regardless so that secp256k1 transactions cost the same gas before and after Keystore integration activates (see [Rationale](#charging-the-keystore-read-before-the-keystore)).
 
-**Calldata floor.** Let `payload_tokens = zero_bytes + 4 * nonzero_bytes` over the bytes `tx_payload_cost` covers, and `execution_gas_used` the gas used by `calls`:
+**Calldata floor.** As in [EIP-7623](./eip-7623.md), the floor applies to the transaction as a whole, including the `payer_auth` bytes. Let `payload_tokens = zero_bytes + 4 * nonzero_bytes` over the bytes `tx_payload_cost` covers, `payer_tokens` the same count over the serialized `payer_auth` (`0` for self-pay), and `execution_gas_used` the gas used by `calls`:
 
 ```
-sender_metered_gas = max(
-    sender_intrinsic_gas + execution_gas_used,
-    (sender_intrinsic_gas - tx_payload_cost) + 10 * payload_tokens
+sender_floor = (sender_intrinsic_gas - tx_payload_cost) + 10 * payload_tokens
+payer_floor  = (payer_auth_cost - payer_data_cost) + 10 * payer_tokens
+
+gas_used = max(
+    sender_intrinsic_gas + execution_gas_used + payer_auth_cost,
+    sender_floor + payer_floor
 )
 ```
 
-A transaction whose `gas_limit` is below the floor branch is invalid. The `payer_auth` bytes are floored the same way within `payer_auth_cost`.
+A transaction whose `gas_limit` is below `sender_floor` is invalid. `payer_floor` is `0` for self-pay. Because `payer_gas_reserve == payer_floor >= payer_auth_cost`, both branches stay within `effective_gas_limit`.
 
 **Gas-schedule profiles.** On a base layer the values above are protocol constants, changeable only through a hard fork (**L1 profile**). An L2 or other high-throughput chain MAY adopt a different schedule fixed under its own consensus (**L2 profile**), but MUST keep the formula's structure and MUST NOT set the calldata-floor rate below `4` or drop the floor.
 
@@ -306,7 +309,7 @@ effective_gas_price  = base_fee + priority_fee_per_gas
 
 The transaction is invalid if `max_fee_per_gas < base_fee` or if the payer's balance is below `max_fee_per_gas * effective_gas_limit`. `GASPRICE` returns `effective_gas_price`.
 
-Before execution the payer is precharged `effective_gas_limit * effective_gas_price`. After execution, with `gas_used` the gas charged (sender-metered gas plus `payer_auth_cost`), the payer is charged `gas_used * effective_gas_price` and refunded the difference. `gas_used * priority_fee_per_gas` goes to the block's fee recipient and `gas_used * base_fee` is burned.
+Before execution the payer is precharged `effective_gas_limit * effective_gas_price`. After execution, with `gas_used` as defined in [Intrinsic Gas](#intrinsic-gas), the payer is charged `gas_used * effective_gas_price` and refunded the difference. `gas_used * priority_fee_per_gas` goes to the block's fee recipient and `gas_used * base_fee` is burned.
 
 ### Validation Flow
 
@@ -315,9 +318,9 @@ Before execution the payer is precharged `effective_gas_limit * effective_gas_pr
 1. Parse and structurally validate the transaction: accepted `account_changes` entry types and counts, and `sender_auth` / `payer_auth` shapes per [Authentication](#authentication).
 2. Resolve the sender and its actor.
 3. If a delegation entry is present, verify `code(sender)` is empty or a delegation indicator, and that the resolved actor may delegate.
-4. Resolve the payer and its actor per [Payer Modes](#payer-modes). Reject if `payer_auth_cost > MAX_AUTHENTICATION_GAS`.
-5. Verify the validity window (after normalization), the calldata floor, that `max_fee_per_gas` covers the current base fee, and that the payer's balance covers `max_fee_per_gas * effective_gas_limit` (see [Fees](#fees)).
-6. Verify the nonce: `nonce_sequence == current_sequence(sender, nonce_key)` for standard keys; for `NONCE_KEY_MAX`, require `nonce_sequence == 0`, a non-zero `valid_before` no farther out than `NONCE_FREE_EXPIRY_WINDOW`, and a fresh `replay_id`.
+4. Resolve the payer and its actor per [Payer Modes](#payer-modes). Reject if `payer_gas_reserve > MAX_AUTHENTICATION_GAS`.
+5. Verify the validity window (after normalization), that `gas_limit` covers `sender_floor`, that `max_fee_per_gas` covers the current base fee, and that the payer's balance covers `max_fee_per_gas * effective_gas_limit` (see [Fees](#fees)). Also verify that the sender's balance covers the sum of `call.value` over all calls, plus `max_fee_per_gas * effective_gas_limit` when the sender is the payer.
+6. Verify the nonce: `nonce_sequence` equals the sender's account nonce for key `0`, or `current_sequence(sender, nonce_key)` for keys `1` through `NONCE_KEY_MAX - 1`; for `NONCE_KEY_MAX`, require `nonce_sequence == 0`, a non-zero `valid_before` no farther out than `NONCE_FREE_EXPIRY_WINDOW`, and a fresh `replay_id`.
 7. Apply per-payer pending limits and the [Mempool Replacement](#mempool-replacement) rules.
 
 Nodes MAY reject a transaction whose `valid_before` is too near to be reliably included, and MAY reject rather than hold one whose `valid_after` is not yet active.
@@ -325,11 +328,11 @@ Nodes MAY reject a transaction whose `valid_before` is too near to be reliably i
 #### Block Execution
 
 1. Check [Fees](#fees) validity and precharge the payer.
-2. If `nonce_key != NONCE_KEY_MAX`, increment the nonce for `(sender, nonce_key)`; otherwise record `replay_id`.
+2. If `nonce_key == 0`, increment the sender's account nonce. If `nonce_key` is `1` through `NONCE_KEY_MAX - 1`, increment the Nonce Manager sequence for `(sender, nonce_key)`. If `nonce_key == NONCE_KEY_MAX`, record `replay_id`.
 3. Apply `account_changes` in order.
 4. Execute `calls` per [Call Execution](#call-execution).
 
-Settlement charges the payer per [Fees](#fees), where `gas_used` is sender-intrinsic gas plus executed `calls` (together bounded by `gas_limit` and floored per the calldata floor) plus `payer_auth_cost`, and refunds the rest of the precharge. `payer_auth_cost` is never refundable.
+Settlement charges the payer for `gas_used` per [Fees](#fees): sender-intrinsic gas plus executed `calls` (together bounded by `gas_limit`) plus `payer_auth_cost`, subject to the calldata floor. It refunds the rest of the precharge. Payer authentication gas is never refundable.
 
 ### Receipts
 
@@ -339,13 +342,13 @@ The [EIP-2718](./eip-2718.md) `ReceiptPayload` for this transaction type is `rlp
 
 ### RPC Extensions
 
-**`eth_getTransactionCount`**: extended with an optional `nonceKey` parameter (`uint256`) that reads the Nonce Manager.
+**`eth_getTransactionCount`**: extended with an optional `nonceKey` parameter (`uint256`). Omitted or `0` returns the account nonce; other keys read the Nonce Manager.
 
 **`eth_getTransactionReceipt`**: in addition to the standard fields, receipts for this type include:
 
 - `payer` (address): the resolved payer (`sender` for self-pay, the named payer, or the payer recovered in open mode).
 - `phaseStatuses` (uint8[]): one entry per phase, `0x01` (success) or `0x00` (reverted). Phases after a revert are not executed and are reported as `0x00`. Empty if `calls` was empty.
-- `gasUsed` includes `payer_auth_cost`.
+- `gasUsed` is `gas_used` from [Intrinsic Gas](#intrinsic-gas), including payer authentication.
 
 **`eth_estimateGas`** / **`eth_call`**: accept the transaction's fields (`sender`, `nonceKey`, `accountChanges`, `calls`, `validAfter`, `validBefore`, `metadata`, `payer`, `senderAuth`, `payerAuth`) alongside the standard request object, and execute the request as an `AA_TX_TYPE` transaction. The sender is taken from `sender` or `from`; if both are present they MUST be equal. Signatures are never verified.
 
@@ -371,7 +374,7 @@ Attribution and annotation data traditionally rides as a suffix on `tx.input`. T
 
 ## Backwards Compatibility
 
-No breaking changes. Existing transaction types, accounts, and nonces are unaffected; Nonce Manager state is separate from account nonces. Adoption is opt-in: an account sends this transaction type or does not. No account is delegated automatically. Activating Keystore integration does not change validity, execution results, or gas for accounts without Keystore state.
+No breaking changes. Existing transaction types and accounts are unaffected. `nonce_key` `0` uses the account nonce, so this type and other transaction types from one account share one sequence at that key; other keys live in the Nonce Manager. Adoption is opt-in: an account sends this transaction type or does not. No account is delegated automatically. Activating Keystore integration does not change validity, execution results, or gas for accounts without Keystore state.
 
 ## Reference Implementation
 
@@ -383,7 +386,7 @@ interface INonceManager {
 }
 ```
 
-Read-only. Gas is a base cost plus a cold (2,100) or warm (100) read per [EIP-2929](./eip-2929.md) access rules.
+Read-only. For `nonceKey == 0` it returns the account nonce. Gas is a base cost plus a cold (2,100) or warm (100) read per [EIP-2929](./eip-2929.md) access rules.
 
 ## Security Considerations
 
